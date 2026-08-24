@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>POLARIX — Admin Reports Panel</title>
+
+<!--
+  ============================================================================
+  POLARIX ADMIN REPORTS PANEL — standalone, not linked from the game.
+  ============================================================================
+  This file is intentionally separate from polarix.html and is never linked,
+  buttoned, or referenced anywhere inside the normal game UI. Only someone who
+  already has this file's URL/path can reach it, and reaching it is not the
+  same as being authorized — that is enforced below by real Firebase
+  Authentication plus Realtime Database security rules, not by anything in
+  this file.
+
+  WHY EMAIL/PASSWORD SIGN-IN (AND NOT A HARDCODED PASSWORD OR HIDDEN BUTTON):
+  POLARIX's existing multiplayer game has no Firebase Authentication at all —
+  every player is anonymous, identified only by a client-generated ID. There
+  is therefore no "existing admin auth" to plug into. Per the project's own
+  rule against faking admin security, this panel does NOT invent a client-side
+  password check (which anyone could read out of the page source or bypass
+  entirely by calling the database directly). Instead it uses real Firebase
+  Authentication (Email/Password), and the actual authorization decision is
+  made server-side by your Realtime Database security rules — this page only
+  reflects whatever those rules allow. No admin credential of any kind lives
+  in this file.
+
+  REQUIRED ONE-TIME SETUP (cannot be done from this HTML file):
+    1. Firebase Console → Authentication → Sign-in method → enable Email/Password.
+    2. Firebase Console → Authentication → Users → add your admin's email + password.
+    3. Copy that admin user's UID.
+    4. Firebase Console → Realtime Database → Data → add a node:
+         admins
+           └── <that UID>: true
+    5. Realtime Database → Rules → add the "reports" / "reportCooldowns" / "admins"
+       rules documented in polarix.html (search for "REPORT_REQUIRED_RULES" /
+       "ADDITIONAL rules required for the Report System" in that file), on top
+       of whatever rules already exist. Do not remove or loosen existing rules.
+  Until steps 1–5 are done, sign-in will succeed (valid Firebase Auth account)
+  but every read/write below will be rejected by the database with a
+  permission-denied error — which this page treats as "not authorized" and
+  signs the account back out. That rejection is the real security boundary,
+  not any check written in this file.
+  ============================================================================
+-->
+
+<script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-database-compat.js"></script>
+
+<style>
+  :root{
+    --bg-deep:#050914; --panel:#0e1a3aee; --panel-line:#1e3a6d;
+    --blue:#3fa9ff; --blue-glow:#5ec2ff; --red:#ff4d6a; --gold:#ffce54;
+    --green:#37e39a; --text:#eaf2ff; --dim:#7d93bf;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0; padding:0; min-height:100%; background:var(--bg-deep); color:var(--text);
+    font-family:'Segoe UI', system-ui, -apple-system, Roboto, sans-serif;}
+  #app{max-width:900px; margin:0 auto; padding:24px 16px 60px;}
+  h1{font-size:1.3em; letter-spacing:1px; margin:0 0 4px;}
+  .sub{color:var(--dim); font-size:.85em; margin-bottom:24px;}
+  .glass{background:var(--panel); border:1px solid var(--panel-line); border-radius:16px;
+    box-shadow:0 8px 32px #00000066;}
+  .hidden{display:none !important;}
+
+  /* ---------- Login ---------- */
+  #loginBox{max-width:360px; margin:60px auto; padding:28px 24px;}
+  #loginBox h2{text-align:center; margin:0 0 18px; font-size:1.1em; letter-spacing:.5px;}
+  #loginBox input{
+    width:100%; padding:13px 14px; margin-bottom:10px; border-radius:10px; border:1px solid var(--panel-line);
+    background:#0a1836; color:var(--text); font-size:.95em; outline:none;
+  }
+  #loginBox input:focus{border-color:var(--blue);}
+  .btn{
+    display:inline-flex; align-items:center; justify-content:center; gap:8px; cursor:pointer;
+    padding:12px 18px; border-radius:10px; border:1px solid #ffffff1a; font-weight:700; font-size:.9em;
+    background:linear-gradient(180deg,#182a5c,#0f1c40); color:var(--text);
+  }
+  .btn.primary{background:linear-gradient(135deg, var(--blue), #1f6fe0); border-color:#5ec2ff55;}
+  .btn.ghost{background:linear-gradient(180deg,#101f45,#0a1330); border:1px solid #22335f; color:var(--blue-glow);}
+  .btn.small{padding:8px 12px; font-size:.78em;}
+  .btn.danger{background:linear-gradient(135deg,#ff4d6a,#b0203a); border-color:#ff7d9255;}
+  .btn:disabled{opacity:.45; pointer-events:none;}
+  .btn.full{width:100%;}
+  .err{color:var(--red); font-size:.8em; min-height:1.2em; margin:6px 0 8px; text-align:center;}
+
+  /* ---------- Panel ---------- */
+  #panelHeader{display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; flex-wrap:wrap; gap:10px;}
+  #panelHeader .who{font-size:.78em; color:var(--dim);}
+  .filters{display:flex; gap:8px; margin-bottom:18px; flex-wrap:wrap;}
+  .filter-tab{
+    padding:9px 16px; border-radius:10px; font-size:.82em; font-weight:700; cursor:pointer;
+    background:#0a1836; border:1px solid var(--panel-line); color:var(--dim);
+  }
+  .filter-tab.active{background:linear-gradient(135deg, var(--blue), #1f6fe0); color:#fff; border-color:#5ec2ff55;}
+
+  .status-msg{color:var(--dim); font-size:.85em; text-align:center; padding:30px 10px;}
+
+  .report-card{padding:16px 18px; margin-bottom:12px;}
+  .report-card .row1{display:flex; justify-content:space-between; align-items:flex-start; gap:10px; margin-bottom:10px;}
+  .report-reason{font-weight:800; font-size:1em; color:var(--text);}
+  .status-badge{font-size:.68em; font-weight:800; padding:4px 10px; border-radius:8px; letter-spacing:.4px; flex-shrink:0;}
+  .status-badge.pending{background:#3a2f0a; color:var(--gold);}
+  .status-badge.reviewed{background:#0d2b22; color:var(--green);}
+  .status-badge.dismissed{background:#2a1626; color:#c98bde;}
+  .report-meta{display:grid; grid-template-columns:1fr 1fr; gap:6px 16px; font-size:.8em; color:var(--dim); margin-bottom:12px;}
+  .report-meta b{color:var(--text); font-weight:600;}
+  .report-meta .full{grid-column:1 / -1;}
+  .report-actions{display:flex; gap:8px; flex-wrap:wrap;}
+
+  #loadTag{font-size:.7em; color:var(--dim); text-align:center; margin-top:10px;}
+
+  /* ---------- Report card is now clickable ---------- */
+  .report-card{cursor:pointer;}
+  .report-card:active{opacity:.85;}
+  .report-actions .btn{cursor:pointer;}
+
+  /* ---------- Modal overlay (shared: profile + confirm) ---------- */
+  .modal-overlay{
+    position:fixed; inset:0; background:#00040dcc; z-index:500; display:none;
+    align-items:flex-start; justify-content:center; padding:20px 14px 40px; overflow-y:auto;
+  }
+  .modal-overlay.show{display:flex;}
+  .modal-box{max-width:480px; width:100%; padding:22px 20px; margin-top:20px;}
+  .modal-box h2{font-size:1.05em; margin:0 0 4px;}
+  .modal-close{position:absolute; top:14px; right:16px; cursor:pointer; color:var(--dim); font-size:1.3em; line-height:1;}
+  #profileModal .modal-box{position:relative;}
+
+  .status-pill{display:inline-block; font-size:.7em; font-weight:800; padding:4px 10px; border-radius:8px; letter-spacing:.4px; margin-top:6px;}
+  .status-pill.active{background:#0d2b22; color:var(--green);}
+  .status-pill.banned{background:#3a0d16; color:var(--red);}
+
+  .profile-grid{display:grid; grid-template-columns:1fr 1fr; gap:10px 16px; margin:18px 0; font-size:.85em;}
+  .profile-grid .full{grid-column:1 / -1;}
+  .profile-grid .lbl{color:var(--dim); font-size:.72em; font-weight:700; letter-spacing:.4px; text-transform:uppercase; margin-bottom:2px;}
+  .profile-grid .val{color:var(--text); font-weight:700; word-break:break-all;}
+  .profile-grid .val.na{color:var(--dim); font-weight:500; font-style:italic;}
+
+  .section-divider{border:none; border-top:1px solid var(--panel-line); margin:18px 0;}
+  .section-title{font-size:.75em; font-weight:800; letter-spacing:.5px; color:var(--dim); text-transform:uppercase; margin-bottom:10px;}
+
+  .profile-loading{text-align:center; color:var(--dim); font-size:.85em; padding:30px 10px;}
+  .profile-actions{display:flex; gap:10px; margin-top:18px; flex-wrap:wrap;}
+  .profile-msg{font-size:.82em; text-align:center; margin-top:10px; min-height:1.2em;}
+  .profile-msg.ok{color:var(--green);}
+  .profile-msg.error{color:var(--red);}
+
+  /* ---------- Ban confirm dialog ---------- */
+  #confirmModal .modal-box{max-width:340px; text-align:center;}
+  #confirmModal .warn-icon{font-size:1.8em; margin-bottom:6px;}
+  #confirmModal h2{color:var(--red);}
+  #confirmModal .confirm-detail{background:#0a1836; border:1px solid var(--panel-line); border-radius:10px; padding:12px 14px; margin:14px 0; text-align:left; font-size:.82em;}
+  #confirmModal .confirm-detail .lbl{color:var(--dim); font-size:.72em; text-transform:uppercase; letter-spacing:.4px;}
+  #confirmModal .confirm-detail .val{font-weight:700; margin-bottom:8px; word-break:break-all;}
+  #confirmModal .confirm-actions{display:flex; gap:10px; margin-top:6px;}
+  #confirmModal .confirm-actions .btn{flex:1;}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- LOGIN -->
+  <div id="loginBox" class="glass">
+    <h2>POLARIX — Admin Sign In</h2>
+    <input type="email" id="loginEmail" placeholder="Admin email" autocomplete="username">
+    <input type="password" id="loginPassword" placeholder="Password" autocomplete="current-password">
+    <div class="err" id="loginErr"></div>
+    <div class="btn primary full" id="btnLogin">SIGN IN</div>
+  </div>
+
+  <!-- PANEL (shown only once Firebase confirms this account is authorized) -->
+  <div id="panel" class="hidden">
+    <div id="panelHeader">
+      <div>
+        <h1>Admin Reports Panel</h1>
+        <div class="sub">Player Report System — moderation review only</div>
+      </div>
+      <div style="text-align:right;">
+        <div class="who" id="whoAmI"></div>
+        <div class="btn ghost small" id="btnSignOut" style="margin-top:6px;">SIGN OUT</div>
+      </div>
+    </div>
+
+    <div class="filters">
+      <div class="filter-tab active" data-filter="all">All</div>
+      <div class="filter-tab" data-filter="pending">Pending</div>
+      <div class="filter-tab" data-filter="reviewed">Reviewed</div>
+      <div class="filter-tab" data-filter="dismissed">Dismissed</div>
+    </div>
+
+    <div id="reportsList"></div>
+    <div class="status-msg hidden" id="emptyMsg">No reports in this view.</div>
+    <div id="loadTag">Showing the most recent 150 reports for this filter · live-updating</div>
+  </div>
+
+  <!-- REPORTED PLAYER PROFILE MODAL -->
+  <div class="modal-overlay" id="profileModal">
+    <div class="glass modal-box">
+      <div class="modal-close" id="btnCloseProfile">✕</div>
+      <div id="profileBody">
+        <div class="profile-loading">Loading player…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- BAN / UNBAN CONFIRM MODAL -->
+  <div class="modal-overlay" id="confirmModal">
+    <div class="glass modal-box">
+      <div class="warn-icon" id="confirmIcon">⚠️</div>
+      <h2 id="confirmTitle">BAN PLAYER?</h2>
+      <div class="confirm-detail">
+        <div class="lbl">Player</div>
+        <div class="val" id="confirmPlayerName">—</div>
+        <div class="lbl">POLARIX ID</div>
+        <div class="val" id="confirmPlayerId">—</div>
+      </div>
+      <div style="font-size:.82em; color:var(--dim);" id="confirmBody">This will permanently disable this POLARIX account.</div>
+      <div class="confirm-actions">
+        <div class="btn ghost" id="btnConfirmCancel">CANCEL</div>
+        <div class="btn danger" id="btnConfirmGo">CONFIRM</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(function(){
+"use strict";
+
+/* Same public Web config as polarix.html (safe for client code — never an Admin SDK key). */
+const firebaseConfig = {
+  apiKey: "AIzaSyAcGYujBPi8pqnkSbxwME3qlL5_NiCg0z0",
+  authDomain: "blackboardbrawl.firebaseapp.com",
+  databaseURL: "https://blackboardbrawl-default-rtdb.firebaseio.com/",
+  projectId: "blackboardbrawl",
+  storageBucket: "blackboardbrawl.firebasestorage.app",
+  messagingSenderId: "94072836496",
+  appId: "1:94072836496:web:81c76a7906b23b6026a315"
+};
+
+let fbAuth=null, fbDB=null;
+try{
+  const app = (firebase.apps && firebase.apps.length) ? firebase.apps[0] : firebase.initializeApp(firebaseConfig);
+  fbAuth = firebase.auth();
+  fbDB = firebase.database();
+}catch(e){
+  document.getElementById('loginErr').textContent='Firebase failed to load — check your connection.';
+  console.error('[ADMIN] init error', e);
+}
+
+const REASON_LABELS=['Cheating / Unfair Play','Harassment','Inappropriate Name','Spam','Other'];
+let currentFilter='all';
+let currentQuery=null, currentHandler=null; // exactly one live listener at a time
+
+function escapeHtml(s){
+  return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtDate(ts){
+  if(!ts) return '—';
+  try{ return new Date(ts).toLocaleString(); }catch(e){ return '—'; }
+}
+
+/* ---------- Auth ---------- */
+document.getElementById('btnLogin').addEventListener('click', doLogin);
+document.getElementById('loginPassword').addEventListener('keydown', e=>{ if(e.key==='Enter') doLogin(); });
+function doLogin(){
+  const email=document.getElementById('loginEmail').value.trim();
+  const pass=document.getElementById('loginPassword').value;
+  const errEl=document.getElementById('loginErr');
+  errEl.textContent='';
+  if(!email || !pass){ errEl.textContent='Enter email and password.'; return; }
+  if(!fbAuth){ errEl.textContent='Firebase not available.'; return; }
+  const btn=document.getElementById('btnLogin');
+  btn.textContent='SIGNING IN…'; btn.style.pointerEvents='none';
+  fbAuth.signInWithEmailAndPassword(email, pass).catch(err=>{
+    btn.textContent='SIGN IN'; btn.style.pointerEvents='';
+    errEl.textContent = (err && err.message) ? err.message : 'Sign-in failed.';
+  });
+}
+document.getElementById('btnSignOut').addEventListener('click', ()=>{
+  detachListener();
+  fbAuth.signOut();
+});
+
+fbAuth && fbAuth.onAuthStateChanged(user=>{
+  const btn=document.getElementById('btnLogin');
+  btn.textContent='SIGN IN'; btn.style.pointerEvents='';
+  if(!user){
+    showLogin();
+    return;
+  }
+  // Signed in with Firebase Auth is NOT the same as being an authorized admin.
+  // The real check is a database read that only succeeds if the security rules
+  // find this uid under /admins — see the rules block documented in polarix.html.
+  fbDB.ref('reports').limitToLast(1).get().then(()=>{
+    document.getElementById('whoAmI').textContent=user.email||'Signed in';
+    showPanel();
+    attachListener();
+  }).catch(err=>{
+    console.error('[ADMIN] authorization check failed', err);
+    document.getElementById('loginErr').textContent='This account is not authorized as an admin.';
+    fbAuth.signOut();
+  });
+});
+
+function showLogin(){
+  document.getElementById('loginBox').classList.remove('hidden');
+  document.getElementById('panel').classList.add('hidden');
+  document.getElementById('loginPassword').value='';
+}
+function showPanel(){
+  document.getElementById('loginBox').classList.add('hidden');
+  document.getElementById('panel').classList.remove('hidden');
+}
+
+/* ---------- Filters ---------- */
+document.querySelectorAll('.filter-tab').forEach(tab=>{
+  tab.addEventListener('click', ()=>{
+    if(tab.getAttribute('data-filter')===currentFilter) return;
+    document.querySelectorAll('.filter-tab').forEach(t=>t.classList.remove('active'));
+    tab.classList.add('active');
+    currentFilter=tab.getAttribute('data-filter');
+    attachListener();
+  });
+});
+
+/* ---------- Efficient, single live listener per filter ---------- */
+function detachListener(){
+  if(currentQuery && currentHandler){ currentQuery.off('value', currentHandler); }
+  currentQuery=null; currentHandler=null;
+}
+function attachListener(){
+  detachListener(); // never stack more than one listener
+  document.getElementById('reportsList').innerHTML='';
+  document.getElementById('emptyMsg').classList.add('hidden');
+  const LIMIT=150; // cap reads instead of downloading the whole node
+  currentQuery = (currentFilter==='all')
+    ? fbDB.ref('reports').orderByChild('timestamp').limitToLast(LIMIT)
+    : fbDB.ref('reports').orderByChild('status').equalTo(currentFilter).limitToLast(LIMIT);
+  currentHandler = currentQuery.on('value', snap=>renderReports(snap.val()||{}), err=>{
+    console.error('[ADMIN] listener error', err);
+    document.getElementById('reportsList').innerHTML='';
+    document.getElementById('emptyMsg').textContent='Could not load reports (permission or connection error).';
+    document.getElementById('emptyMsg').classList.remove('hidden');
+  });
+}
+// Clean up the live listener the moment this tab/window closes — required by the
+// "Admin Panel close hone par listeners clean up karo" rule.
+window.addEventListener('pagehide', detachListener);
+window.addEventListener('beforeunload', detachListener);
+
+function renderReports(data){
+  const list=document.getElementById('reportsList');
+  const emptyMsg=document.getElementById('emptyMsg');
+  const ids=Object.keys(data).sort((a,b)=>(data[b].timestamp||0)-(data[a].timestamp||0));
+  list.innerHTML='';
+  if(!ids.length){ emptyMsg.textContent='No reports in this view.'; emptyMsg.classList.remove('hidden'); return; }
+  emptyMsg.classList.add('hidden');
+  ids.forEach(id=>{
+    const r=data[id]||{};
+    const status=r.status||'pending';
+    const card=document.createElement('div');
+    card.className='report-card glass';
+    card.innerHTML=`
+      <div class="row1">
+        <div class="report-reason">${escapeHtml(r.reason||'—')}</div>
+        <div class="status-badge ${status}">${status.toUpperCase()}</div>
+      </div>
+      <div class="report-meta">
+        <div><b>Reporter ID</b><br>${escapeHtml(r.reporterId||'—')}</div>
+        <div><b>Reported Player ID</b><br>${escapeHtml(r.reportedPlayerId||'—')}</div>
+        <div class="full"><b>Date/Time</b> ${escapeHtml(fmtDate(r.timestamp))}</div>
+      </div>
+      <div class="report-actions"></div>`;
+    const actions=card.querySelector('.report-actions');
+    if(status==='pending'){
+      actions.appendChild(makeActionBtn('Mark Reviewed', 'primary', ()=>setStatus(id,'reviewed')));
+      actions.appendChild(makeActionBtn('Dismiss', 'ghost', ()=>setStatus(id,'dismissed')));
+    }else if(status==='reviewed'){
+      actions.appendChild(makeActionBtn('Return to Pending', 'ghost', ()=>setStatus(id,'pending')));
+      actions.appendChild(makeActionBtn('Dismiss', 'ghost', ()=>setStatus(id,'dismissed')));
+    }else{ // dismissed
+      actions.appendChild(makeActionBtn('Return to Pending', 'ghost', ()=>setStatus(id,'pending')));
+    }
+    // Whole card opens the REPORTED PLAYER'S profile (never the reporter's) — uses this exact
+    // report's reportedPlayerId, never the display name alone. Action buttons stop propagation
+    // below so Mark Reviewed / Dismiss / Return to Pending keep working exactly as before.
+    card.addEventListener('click', ()=>openProfile(id, r));
+    list.appendChild(card);
+  });
+}
+function makeActionBtn(label, cls, onClick){
+  const b=document.createElement('div');
+  b.className='btn small '+cls;
+  b.textContent=label;
+  b.addEventListener('click', (e)=>{ e.stopPropagation(); b.style.pointerEvents='none'; onClick(); });
+  return b;
+}
+
+/* Status-only moderation action. No automatic ban/punishment of any kind is ever
+   triggered by report volume or by this panel — a human admin decides everything. */
+function setStatus(reportId, newStatus){
+  fbDB.ref('reports/'+reportId+'/status').set(newStatus).catch(err=>{
+    console.error('[ADMIN] status update failed', err);
+    alert('Could not update this report — check your connection/permissions.');
+  });
+  // Keep an already-open profile's Report Information block in sync instead of just the list.
+  if(PROFILE.openReportId===reportId){ PROFILE.reportStatus=newStatus; renderReportInfoStatus(); }
+}
+
+/* ==========================================================================================
+   REPORTED PLAYER PROFILE
+   ------------------------------------------------------------------------------------------
+   Opens the profile of whoever was REPORTED in this exact report — always keyed off this
+   report's own reportedPlayerId, never off the display name and never the reporter's id.
+   Player fields come straight from players/{reportedPlayerId} in Firebase (see the structure
+   documented in polarix.html: { name, nameLower, online, lastSeen, createdAt }). Gameplay
+   stats such as coins/matches/wins/losses/players defeated/mass collected/rank are NOT part
+   of that Firebase record — POLARIX currently keeps those only in each player's own local
+   device save (SAVE), so they do not exist server-side for any other player to read. Rather
+   than invent numbers, every stat that has no real Firebase field simply renders "Not
+   available". If POLARIX is later changed to sync those stats server-side, this panel will
+   pick them up automatically the moment they appear on the players/{id} record — no fake
+   placeholders are stored anywhere in the meantime.
+   ========================================================================================== */
+const PROFILE={ openReportId:null, report:null, playerId:null, player:null, reportStatus:null };
+
+document.getElementById('btnCloseProfile').addEventListener('click', closeProfile);
+document.getElementById('profileModal').addEventListener('click', e=>{ if(e.target.id==='profileModal') closeProfile(); });
+
+function openProfile(reportId, report){
+  PROFILE.openReportId=reportId;
+  PROFILE.report=report||{};
+  PROFILE.reportStatus=report && report.status || 'pending';
+  PROFILE.playerId=(report && report.reportedPlayerId) || null;
+  PROFILE.player=null;
+  document.getElementById('profileBody').innerHTML='<div class="profile-loading">Loading player…</div>';
+  document.getElementById('profileModal').classList.add('show');
+  if(!PROFILE.playerId){
+    document.getElementById('profileBody').innerHTML='<div class="profile-loading">This report has no reportedPlayerId — cannot load a profile.</div>';
+    return;
+  }
+  // Reporter name is a courtesy lookup only (not stored on the report itself) — never used
+  // for anything except display, and never confused with the reported player below.
+  const reporterId=report.reporterId||null;
+  Promise.all([
+    fbDB.ref('players/'+PROFILE.playerId).get(),
+    reporterId ? fbDB.ref('players/'+reporterId).get().catch(()=>null) : Promise.resolve(null)
+  ]).then(([playerSnap, reporterSnap])=>{
+    if(PROFILE.openReportId!==reportId) return; // modal closed/reopened before this resolved
+    PROFILE.player = playerSnap.exists() ? playerSnap.val() : null;
+    PROFILE.reporterName = (reporterSnap && reporterSnap.exists() && reporterSnap.val().name) || null;
+    renderProfile();
+  }).catch(err=>{
+    console.error('[ADMIN] profile load failed', err);
+    if(PROFILE.openReportId!==reportId) return;
+    document.getElementById('profileBody').innerHTML='<div class="profile-loading">Could not load this player (permission or connection error).</div>';
+  });
+}
+function closeProfile(){
+  document.getElementById('profileModal').classList.remove('show');
+  PROFILE.openReportId=null; PROFILE.report=null; PROFILE.playerId=null; PROFILE.player=null;
+}
+function naVal(v){
+  return (v===undefined || v===null || v==='') ? '<span class="val na">Not available</span>' : '<span class="val">'+escapeHtml(v)+'</span>';
+}
+function statField(label, htmlVal, full){
+  return '<div class="'+(full?'full ':'')+'"><div class="lbl">'+escapeHtml(label)+'</div>'+htmlVal+'</div>';
+}
+function renderProfile(){
+  const p=PROFILE.player, id=PROFILE.playerId, r=PROFILE.report||{};
+  const exists=!!p;
+  const banned = exists && p.banned===true;
+  const statusLabel = !exists ? 'UNKNOWN' : (banned?'BANNED':'ACTIVE');
+  const statusCls = !exists ? '' : (banned?'banned':'active');
+  const name = exists ? (p.name||'Not available') : 'Player record not found';
+
+  const html = `
+    <h2>Reported Player Profile</h2>
+    <div class="sub">${exists?'':'No Firebase record exists yet for this Player ID.'}</div>
+    <div class="status-pill ${statusCls}" id="profileStatusPill">${statusLabel}</div>
+
+    <div class="profile-grid">
+      ${statField('Player', exists?('<span class="val">'+escapeHtml(name)+'</span>'):naVal(null), true)}
+      ${statField('POLARIX ID', '<span class="val">'+escapeHtml(id)+'</span>', true)}
+      ${statField('Coins', naVal(null))}
+      ${statField('Matches', naVal(null))}
+      ${statField('Wins', naVal(null))}
+      ${statField('Losses', naVal(null))}
+      ${statField('Players Defeated', naVal(null))}
+      ${statField('Mass Collected', naVal(null))}
+      ${statField('Rank', naVal(null))}
+      ${statField('Online', exists?naVal(p.online===true?'Yes':(p.online===false?'No':null)):naVal(null))}
+      ${statField('Account Created', exists?naVal(p.createdAt?fmtDate(p.createdAt):null):naVal(null), true)}
+      ${statField('Last Active', exists?naVal(p.lastSeen?fmtDate(p.lastSeen):null):naVal(null), true)}
+    </div>
+
+    <hr class="section-divider">
+    <div class="section-title">Report Information</div>
+    <div class="profile-grid" id="reportInfoGrid">
+      ${statField('Report ID', naVal(r.reportId||PROFILE.openReportId), true)}
+      ${statField('Reporter ID', naVal(r.reporterId))}
+      ${statField('Reporter Name', naVal(PROFILE.reporterName))}
+      ${statField('Reported Player ID', naVal(r.reportedPlayerId))}
+      ${statField('Reason', naVal(r.reason), true)}
+      ${statField('Timestamp', naVal(r.timestamp?fmtDate(r.timestamp):null))}
+      ${statField('Status', '<span class="val" id="reportInfoStatusVal">'+escapeHtml((PROFILE.reportStatus||'pending').toUpperCase())+'</span>')}
+    </div>
+
+    <hr class="section-divider">
+    <div class="section-title">Admin Actions</div>
+    <div class="profile-actions" id="profileActionsRow">
+      ${exists ? ('<div class="btn danger" id="btnBanToggle">'+(banned?'UNBAN PLAYER':'BAN PLAYER')+'</div>') : ''}
+    </div>
+    <div class="profile-msg" id="profileMsg"></div>
+  `;
+  document.getElementById('profileBody').innerHTML=html;
+  if(exists){
+    document.getElementById('btnBanToggle').addEventListener('click', ()=>askBanConfirm(banned));
+  }
+}
+function renderReportInfoStatus(){
+  const el=document.getElementById('reportInfoStatusVal');
+  if(el) el.textContent=(PROFILE.reportStatus||'pending').toUpperCase();
+}
+
+/* ---------- Ban / Unban with mandatory confirm dialog ---------- */
+function askBanConfirm(isCurrentlyBanned){
+  const willBan=!isCurrentlyBanned;
+  document.getElementById('confirmIcon').textContent = willBan?'⚠️':'♻️';
+  document.getElementById('confirmTitle').textContent = willBan?'BAN PLAYER?':'UNBAN PLAYER?';
+  document.getElementById('confirmBody').textContent = willBan
+    ? 'This will permanently disable this POLARIX account.'
+    : 'This will restore normal game access for this POLARIX account.';
+  document.getElementById('confirmPlayerName').textContent = (PROFILE.player && PROFILE.player.name) || 'Not available';
+  document.getElementById('confirmPlayerId').textContent = PROFILE.playerId;
+  const goBtn=document.getElementById('btnConfirmGo');
+  goBtn.textContent = willBan?'CONFIRM BAN':'CONFIRM UNBAN';
+  goBtn.className = 'btn '+(willBan?'danger':'primary');
+  document.getElementById('confirmModal').classList.add('show');
+  goBtn.onclick=()=>{ goBtn.style.pointerEvents='none'; executeBanToggle(willBan); };
+}
+document.getElementById('btnConfirmCancel').addEventListener('click', ()=>{
+  document.getElementById('confirmModal').classList.remove('show');
+});
+document.getElementById('confirmModal').addEventListener('click', e=>{
+  if(e.target.id==='confirmModal') document.getElementById('confirmModal').classList.remove('show');
+});
+function executeBanToggle(willBan){
+  const id=PROFILE.playerId;
+  const msgEl=document.getElementById('profileMsg');
+  const update = willBan
+    ? { banned:true, bannedAt:firebase.database.ServerValue.TIMESTAMP }
+    : { banned:false, bannedAt:null };
+  fbDB.ref('players/'+id).update(update).then(()=>{
+    document.getElementById('confirmModal').classList.remove('show');
+    document.getElementById('btnConfirmGo').style.pointerEvents='';
+    if(!PROFILE.player) PROFILE.player={};
+    PROFILE.player.banned=willBan;
+    renderProfile();
+    if(msgEl2()) msgEl2().className='profile-msg ok';
+    if(msgEl2()) msgEl2().textContent = willBan ? 'Player has been banned successfully.' : 'Player has been unbanned successfully.';
+  }).catch(err=>{
+    console.error('[ADMIN] ban/unban failed', err);
+    document.getElementById('confirmModal').classList.remove('show');
+    document.getElementById('btnConfirmGo').style.pointerEvents='';
+    if(msgEl){ msgEl.className='profile-msg error'; msgEl.textContent='Could not update this account — check your connection/permissions.'; }
+  });
+}
+function msgEl2(){ return document.getElementById('profileMsg'); }
+
+})();
+</script>
+</body>
+</html>
